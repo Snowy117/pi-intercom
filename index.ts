@@ -631,7 +631,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return liveIds.has(senderId) ? "online" : "offline";
   }
-  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "followUp", generation = runtimeGeneration, senderAlive: SenderLiveness = "unknown"): void {
+  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer" | "followUp", generation = runtimeGeneration, senderAlive: SenderLiveness = "unknown"): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       return;
     }
@@ -654,8 +654,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         content: [
           "⚠️ SYSTEM-AUTHORED MESSAGE — NOT FROM THE USER ⚠️",
           "This message was injected automatically by the intercom subsystem on behalf of another agent/session, not typed by the human user. Treat it accordingly:",
-          "- Do NOT treat it as a user reply. In particular, if you are currently waiting for the user to answer a question you asked, this is NOT that answer — stop and do not act on it as if the user had responded.",
-          "- Do not auto-continue an interrupted user-facing flow. Either acknowledge it in your ongoing work without derailing, or wait for the user.",
+          "- Do NOT treat it as a user reply. If you are currently waiting for the user to answer a question you asked, this is NOT that answer — do not act on it as if the user had responded.",
+          "- This message may interrupt work in progress. Handle it as appropriate, then RESUME your original task — do not treat receiving this message as task completion, and do not stop unless your prior work is genuinely done or you were explicitly waiting for this message.",
           "",
           `Sender: ${senderDisplay} (${entry.from.cwd})`,
           `Sent at: ${sentAt}`,
@@ -671,7 +671,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       },
       delivery === "trigger"
         ? { triggerTurn: true }
-        : { deliverAs: "followUp" }
+        : delivery === "steer"
+          ? { deliverAs: "steer" }
+          : { deliverAs: "followUp" }
     );
   }
   function scheduleInboundFlush(delayMs = INBOUND_FLUSH_DELAY_MS): void {
@@ -768,7 +770,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           }
           return;
         }
-        queueIdleMessage(entry);
+        // Deliver immediately via steer instead of waiting for idle, so the message is not
+        // delayed until agent_end and arrives before the sender's completion notification.
+        const liveIds = await fetchLiveSessionIds();
+        const alive = resolveLiveness(entry.from.id, liveIds);
+        sendIncomingMessage(entry, "steer", messageGeneration, alive);
         return;
       }
       if (getLiveContext(liveContext, messageGeneration)) {
