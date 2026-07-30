@@ -27,8 +27,8 @@ const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
 // pi-subagents native supervisor channel bridge. When pi-subagents and
 // pi-intercom are co-installed, pi-intercom's contact_supervisor wins the tool
 // registration race. These envs (set by pi-subagents' pi-args.ts) let us
-// additionally write a native SupervisorRequest file so pi-subagents' parent
-// poller detects the request and fires its foreground-detach machinery.
+// additionally write a native SupervisorRequest receipt so pi-subagents' parent
+// poller can wake foreground execution or an active wait.
 const SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV = "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR";
 const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV = "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID";
 const SUPERVISOR_REQUESTS_DIR = "requests";
@@ -142,16 +142,12 @@ function readChildOrchestratorMetadata(): ChildOrchestratorMetadata | null {
  * Cross-protocol bridge to pi-subagents' native supervisor channel.
  *
  * When pi-subagents and pi-intercom are co-installed, this session's
- * contact_supervisor is pi-intercom's (broker-based). That path never writes
- * the filesystem request file pi-subagents' parent poller watches for, so the
- * parent's foreground-detach machinery never fires and the orchestrator stays
- * blocked. Writing this file — in the exact schema pi-subagents parses — lets
- * the existing poller discover the request and trigger detach, with no
- * parent-side code change.
+ * contact_supervisor is pi-intercom's broker-based tool. After broker delivery,
+ * this additive receipt lets pi-subagents' parent poller wake foreground
+ * execution or an active wait without duplicating the authoritative message.
  *
- * The broker remains the authoritative transport (delivery, reply, UI); this
- * file is purely a detach trigger + receipt. Failures are best-effort and must
- * never break the broker send.
+ * The broker remains authoritative for delivery, reply, and UI. Receipt writes
+ * and cleanup are best-effort and must never break broker behavior.
  */
 function writeNativeSupervisorRequest(input: {
   requestId: string;
@@ -160,12 +156,12 @@ function writeNativeSupervisorRequest(input: {
   expectsReply: boolean;
   metadata: ChildOrchestratorMetadata;
   interview?: unknown;
-}): void {
+}): string | undefined {
   const channelDir = process.env[SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV]?.trim();
   const orchestratorSessionId = process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV]?.trim();
   if (!channelDir || !orchestratorSessionId) {
     // Not a pi-subagents child, or the native channel is not active. Nothing to bridge.
-    return;
+    return undefined;
   }
   const createdAt = Date.now();
   const expectsReply = input.expectsReply;
@@ -181,6 +177,7 @@ function writeNativeSupervisorRequest(input: {
     runId: input.metadata.runId,
     agent: input.metadata.agent,
     childIndex: Number(input.metadata.index),
+    replyTransport: "pi-intercom",
     ...(input.metadata.sessionName ? { childTarget: input.metadata.sessionName } : {}),
   };
   if (expectsReply) request.expiresAt = createdAt + SUPERVISOR_NATIVE_ASK_TIMEOUT_MS;
@@ -199,6 +196,7 @@ function writeNativeSupervisorRequest(input: {
     try {
       fs.writeFileSync(temp, JSON.stringify(request, null, 2), { mode: 0o600 });
       fs.renameSync(temp, target);
+      return target;
     } finally {
       try { fs.rmSync(temp, { force: true }); } catch { /* temp cleanup is best-effort */ }
     }
@@ -206,6 +204,16 @@ function writeNativeSupervisorRequest(input: {
     // The native file is a detach trigger only; a write failure must not break
     // the broker send that follows. The parent simply will not detach (pre-fix
     // behavior), but the message still reaches the supervisor via the broker.
+  }
+  return undefined;
+}
+
+function removeNativeSupervisorRequest(requestPath: string | undefined): void {
+  if (!requestPath) return;
+  try {
+    fs.rmSync(requestPath, { force: true });
+  } catch {
+    // Native receipt cleanup is best-effort; broker reply lifecycle remains authoritative.
   }
 }
 function formatChildOrchestratorMessage(kind: "ask" | "update" | "interview", metadata: ChildOrchestratorMetadata, message: string): string {
@@ -1329,16 +1337,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               timestamp: Date.now(),
               subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
             });
-            // Cross-protocol bridge: surface the progress note via pi-subagents'
-            // native channel too (expectsReply:false), so a co-installed
-            // pi-subagents parent sees it without a blocking reply. Best-effort.
-            writeNativeSupervisorRequest({
-              requestId: result.id,
-              reason,
-              message: formatChildOrchestratorMessage("update", metadata, message),
-              expectsReply: false,
-              metadata,
-            });
             return {
               content: [{ type: "text", text: `Progress update sent to supervisor ${metadata.orchestratorTarget}` }],
               isError: false,
@@ -1362,6 +1360,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
 
         let replyPromise: Promise<Message> | null = null;
+        let nativeReceiptPath: string | undefined;
         try {
           const questionId = randomUUID();
           replyPromise = waitForReply(sendTo, questionId, signal);
@@ -1382,18 +1381,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           const requestText = reason === "interview_request"
             ? formatChildOrchestratorMessage("interview", metadata, formatSupervisorInterviewRequest(supervisorInterview!, typeof params.message === "string" ? params.message : undefined))
             : formatChildOrchestratorMessage("ask", metadata, params.message as string);
-          // Cross-protocol bridge: also write a native pi-subagents SupervisorRequest
-          // file so the parent's foreground-detach machinery fires (see
-          // writeNativeSupervisorRequest). Done before the broker send and keyed on
-          // questionId so a native reply file could correlate later. Best-effort.
-          writeNativeSupervisorRequest({
-            requestId: questionId,
-            reason,
-            message: requestText,
-            expectsReply: true,
-            metadata,
-            ...(reason === "interview_request" && supervisorInterview ? { interview: supervisorInterview } : {}),
-          });
           const sendResult = await connectedClient.send(sendTo, {
             messageId: questionId,
             text: requestText,
@@ -1415,6 +1402,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               details: { error: true },
             };
           }
+          nativeReceiptPath = writeNativeSupervisorRequest({
+            requestId: questionId,
+            reason,
+            message: requestText,
+            expectsReply: true,
+            metadata,
+            ...(reason === "interview_request" && supervisorInterview ? { interview: supervisorInterview } : {}),
+          });
           pi.appendEntry("intercom_sent", {
             to: metadata.orchestratorTarget,
             message: {
@@ -1460,6 +1455,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             isError: true,
             details: { error: true },
           };
+        } finally {
+          removeNativeSupervisorRequest(nativeReceiptPath);
         }
       },
       renderCall(args, theme) {

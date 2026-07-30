@@ -1,6 +1,6 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
@@ -15,18 +15,29 @@ const childEnvKeys = [
   "PI_SUBAGENT_CHILD_AGENT",
   "PI_SUBAGENT_CHILD_INDEX",
   "PI_SUBAGENT_INTERCOM_SESSION_NAME",
+  "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR",
+  "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID",
 ] as const;
+const ambientChildEnv = new Map(childEnvKeys.map((key) => [key, process.env[key]]));
+for (const key of childEnvKeys) delete process.env[key];
 const sharedHomeDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-home-"));
 const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
 const { IntercomClient } = await import("./broker/client.ts");
-process.on("exit", () => {
+function restoreAmbientEnvironment(): void {
   process.env.HOME = previousHome;
   process.env.USERPROFILE = previousUserProfile;
+  for (const key of childEnvKeys) {
+    const value = ambientChildEnv.get(key);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   rmSync(sharedHomeDir, { recursive: true, force: true });
-});
+}
+after(restoreAmbientEnvironment);
+process.on("exit", restoreAmbientEnvironment);
 
 async function waitForBrokerReady(broker: ChildProcessWithoutNullStreams): Promise<void> {
   const ready = new Promise<void>((resolve, reject) => {
@@ -63,6 +74,8 @@ async function withChildOrchestratorEnv<T>(metadata: {
   agent?: string;
   index?: string;
   sessionName?: string;
+  supervisorChannelDir?: string;
+  orchestratorSessionId?: string;
 }, fn: () => T | Promise<T>): Promise<T> {
   const previous = new Map<string, string | undefined>();
   for (const key of childEnvKeys) {
@@ -74,6 +87,8 @@ async function withChildOrchestratorEnv<T>(metadata: {
   if (metadata.agent !== undefined) process.env.PI_SUBAGENT_CHILD_AGENT = metadata.agent;
   if (metadata.index !== undefined) process.env.PI_SUBAGENT_CHILD_INDEX = metadata.index;
   if (metadata.sessionName !== undefined) process.env.PI_SUBAGENT_INTERCOM_SESSION_NAME = metadata.sessionName;
+  if (metadata.supervisorChannelDir !== undefined) process.env.PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR = metadata.supervisorChannelDir;
+  if (metadata.orchestratorSessionId !== undefined) process.env.PI_SUBAGENT_ORCHESTRATOR_SESSION_ID = metadata.orchestratorSessionId;
   try {
     return await fn();
   } finally {
@@ -83,6 +98,18 @@ async function withChildOrchestratorEnv<T>(metadata: {
       else process.env[key] = value;
     }
   }
+}
+
+
+async function waitForNativeRequest(channelDir: string): Promise<string> {
+  const requestsDir = path.join(channelDir, "requests");
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    const file = existsSync(requestsDir) ? readdirSync(requestsDir).find((name) => name.endsWith(".json")) : undefined;
+    if (file) return path.join(requestsDir, file);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for native supervisor receipt");
 }
 
 interface CapturedToolResult {
@@ -394,7 +421,7 @@ test("sessions publish automatic lifecycle status", { concurrency: false }, asyn
   }
 });
 
-test("busy interactive sessions idle-gate top-level asks without aborting", { concurrency: false }, async () => {
+test("busy interactive sessions steer top-level asks without aborting", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { planner, cleanup } = await setupClients();
   let abortCount = 0;
@@ -419,16 +446,9 @@ test("busy interactive sessions idle-gate top-level asks without aborting", { co
     assert.equal(delivered.delivered, true);
     await new Promise((resolve) => setTimeout(resolve, 250));
     assert.equal(abortCount, 0);
-    assert.equal(harness.sentMessages.length, 0);
-
-    idle = true;
-    await harness.emitLifecycle("agent_end");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    assert.equal(abortCount, 0);
     assert.equal(harness.sentMessages.length, 1);
     assert.equal(harness.sentMessages[0]?.message.customType, "intercom_message");
-    assert.equal(harness.sentMessages[0]?.options?.triggerTurn, true);
+    assert.equal(harness.sentMessages[0]?.options?.deliverAs, "steer");
     assert.match(harness.sentMessages[0]?.message.content ?? "", /Can you respond after your current turn/);
   } finally {
     await harness.emitLifecycle("session_shutdown");
@@ -519,14 +539,15 @@ test("queued inbound messages are discarded after shutdown", { concurrency: fals
     });
     assert.equal(delivered.delivered, true);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(harness.sentMessages.length, 0);
+    assert.equal(harness.sentMessages.length, 1);
+    assert.equal(harness.sentMessages[0]?.options?.deliverAs, "steer");
 
     await harness.emitLifecycle("session_shutdown");
     idle = true;
     await harness.emitLifecycle("agent_end");
     await new Promise((resolve) => setTimeout(resolve, 250));
 
-    assert.equal(harness.sentMessages.length, 0);
+    assert.equal(harness.sentMessages.length, 1);
   } finally {
     await cleanup();
   }
@@ -596,6 +617,7 @@ test("supervisor tool registers only when child metadata is present", async () =
 test("child supervisor tool resolves target and includes run metadata", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { orchestrator, cleanup } = await setupClients();
+  const channelDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-supervisor-channel-"));
 
   try {
     await withChildOrchestratorEnv({
@@ -604,6 +626,8 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       agent: "worker",
       index: "0",
       sessionName: "subagent-worker-78f659a3-1",
+      supervisorChannelDir: channelDir,
+      orchestratorSessionId: "orchestrator-session-test",
     }, async () => {
       const harness = createExtensionHarness("subagent-worker-78f659a3-1");
       piIntercomExtension(harness.pi as never);
@@ -620,12 +644,18 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       assert.match(askMessage.content.text, /Agent: worker/);
       assert.match(askMessage.content.text, /Child index: 0/);
       assert.match(askMessage.content.text, /Which API should I use\?/);
+      const askReceiptPath = await waitForNativeRequest(channelDir);
+      const askReceipt = JSON.parse(readFileSync(askReceiptPath, "utf-8")) as Record<string, unknown>;
+      assert.equal(askReceipt.id, askMessage.id);
+      assert.equal(askReceipt.replyTransport, "pi-intercom");
+      assert.equal(askReceipt.orchestratorSessionId, "orchestrator-session-test");
 
       const reply = await orchestrator.send(askFrom.id, { text: "Use the stable API.", replyTo: askMessage.id });
       assert.equal(reply.delivered, true);
       const askResult = await askResultPromise;
       assert.equal(askResult.isError, false);
       assert.match(askResult.content[0]?.text ?? "", /Use the stable API/);
+      assert.equal(existsSync(askReceiptPath), false);
 
       const updateReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
       const updateResult = await supervisorTool.execute("update-1", { reason: "progress_update", message: "Found a schema mismatch." }, new AbortController().signal, undefined, harness.ctx);
@@ -636,6 +666,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       assert.match(updateMessage.content.text, /Agent: worker/);
       assert.match(updateMessage.content.text, /Found a schema mismatch/);
       assert.equal(updateResult.isError, false);
+      assert.deepEqual(existsSync(path.join(channelDir, "requests")) ? readdirSync(path.join(channelDir, "requests")) : [], []);
 
       const interviewReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
       const interview = {
@@ -700,6 +731,7 @@ test("child supervisor tool resolves target and includes run metadata", { concur
     });
   } finally {
     await cleanup();
+    rmSync(channelDir, { recursive: true, force: true });
   }
 });
 
@@ -741,6 +773,7 @@ test("child supervisor tool rejects invalid reasons and interview payloads", asy
 test("child supervisor tool preserves delivery failure reasons", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { cleanup } = await setupClients();
+  const channelDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-supervisor-failure-"));
 
   try {
     await withChildOrchestratorEnv({
@@ -748,6 +781,8 @@ test("child supervisor tool preserves delivery failure reasons", { concurrency: 
       runId: "78f659a3",
       agent: "worker",
       index: "0",
+      supervisorChannelDir: channelDir,
+      orchestratorSessionId: "orchestrator-session-failure",
     }, async () => {
       const harness = createExtensionHarness();
       piIntercomExtension(harness.pi as never);
@@ -766,16 +801,19 @@ test("child supervisor tool preserves delivery failure reasons", { concurrency: 
       assert.equal(secondAskResult.isError, true);
       assert.match(secondAskResult.content[0]?.text ?? "", /Session not found/);
       assert.doesNotMatch(secondAskResult.content[0]?.text ?? "", /Already waiting/);
+      assert.deepEqual(existsSync(path.join(channelDir, "requests")) ? readdirSync(path.join(channelDir, "requests")) : [], []);
       await harness.emitLifecycle("session_shutdown");
     });
   } finally {
     await cleanup();
+    rmSync(channelDir, { recursive: true, force: true });
   }
 });
 
 test("child supervisor tool clears reply waiter when cancelled", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { orchestrator, cleanup } = await setupClients();
+  const channelDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-supervisor-cancel-"));
 
   try {
     await withChildOrchestratorEnv({
@@ -784,6 +822,8 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
       agent: "worker",
       index: "0",
       sessionName: "subagent-worker-78f659a3-1",
+      supervisorChannelDir: channelDir,
+      orchestratorSessionId: "orchestrator-session-cancel",
     }, async () => {
       const harness = createExtensionHarness("subagent-worker-78f659a3-1");
       piIntercomExtension(harness.pi as never);
@@ -794,10 +834,12 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
       const cancelledMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
       const cancelledResultPromise = supervisorTool.execute("ask-cancelled", { reason: "need_decision", message: "Should I continue?" }, controller.signal, undefined, harness.ctx);
       await cancelledMessage;
+      const cancelledReceiptPath = await waitForNativeRequest(channelDir);
       controller.abort();
       const cancelledResult = await cancelledResultPromise;
       assert.equal(cancelledResult.isError, true);
       assert.match(cancelledResult.content[0]?.text ?? "", /Cancelled/);
+      assert.equal(existsSync(cancelledReceiptPath), false);
 
       const nextMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
       const nextResultPromise = supervisorTool.execute("ask-next", { reason: "need_decision", message: "Can I ask again?" }, new AbortController().signal, undefined, harness.ctx);
@@ -808,10 +850,20 @@ test("child supervisor tool clears reply waiter when cancelled", { concurrency: 
       const nextResult = await nextResultPromise;
       assert.equal(nextResult.isError, false);
       assert.match(nextResult.content[0]?.text ?? "", /Yes\./);
+
+      const shutdownMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+      const shutdownResultPromise = supervisorTool.execute("ask-shutdown", { reason: "need_decision", message: "Wait through shutdown?" }, new AbortController().signal, undefined, harness.ctx);
+      await shutdownMessage;
+      const shutdownReceiptPath = await waitForNativeRequest(channelDir);
       await harness.emitLifecycle("session_shutdown");
+      const shutdownResult = await shutdownResultPromise;
+      assert.equal(shutdownResult.isError, true);
+      assert.match(shutdownResult.content[0]?.text ?? "", /shutting down/i);
+      assert.equal(existsSync(shutdownReceiptPath), false);
     });
   } finally {
     await cleanup();
+    rmSync(channelDir, { recursive: true, force: true });
   }
 });
 
@@ -886,7 +938,7 @@ test("subagent control intercom events wake the current orchestrator session", a
 
   assert.equal(sentMessages.length, 1);
   assert.equal(sentMessages[0]?.message.customType, "intercom_message");
-  assert.match(sentMessages[0]?.message.content ?? "", /From subagent-control/);
+  assert.match(sentMessages[0]?.message.content ?? "", /Sender: subagent-control/);
   assert.match(sentMessages[0]?.message.content ?? "", /worker needs attention in run 78f659a3/);
   assert.equal(sentMessages[0]?.options?.triggerTurn, true);
 });
@@ -927,7 +979,7 @@ test("subagent result intercom events wake the current orchestrator session", as
 
   assert.equal(sentMessages.length, 1);
   assert.equal(sentMessages[0]?.message.customType, "intercom_message");
-  assert.match(sentMessages[0]?.message.content ?? "", /From subagent-result/);
+  assert.match(sentMessages[0]?.message.content ?? "", /Sender: subagent-result/);
   assert.match(sentMessages[0]?.message.content ?? "", /Status: completed/);
   assert.equal(sentMessages[0]?.options?.triggerTurn, true);
   assert.deepEqual(deliveryAcks, [{ requestId: "result-1", delivered: true }]);
